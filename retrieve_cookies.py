@@ -7,28 +7,21 @@ try:
 except ImportError:
     COOKIES_FILE = "cookies.json"
 
-try:
-    import browser_cookie3
-except ImportError:
-    raise ImportError("Please run this program via: uv run --with browser_cookie3 python retrieve_cookies.py")
-
 def get_oreilly_cookies():
-    try:
-        from safaribooks import load_browser_oreilly_cookies
-    except ImportError:
-        load_browser_oreilly_cookies = None
+    from safaribooks import load_browser_oreilly_cookies
 
-    if load_browser_oreilly_cookies is not None:
-        cookies = load_browser_oreilly_cookies()
-        if cookies is None:
-            raise RuntimeError("Could not read O'Reilly cookies from the local browser.")
-        return cookies
-
-    cj = browser_cookie3.load(domain_name="oreilly.com")
-    cookies = {}
-    for c in cj:
-        if c.value:
-            cookies[c.name] = c.value
+    cookies = load_browser_oreilly_cookies()
+    if cookies is None:
+        raise ImportError(
+            "browser_cookie3 is not installed for this interpreter.\n"
+            "    .venv/bin/python -m pip install -r requirements.txt\n"
+            "    .venv/bin/python retrieve_cookies.py"
+        )
+    if not cookies.get("orm-jwt"):
+        raise RuntimeError(
+            "No orm-jwt cookie found in the local browser.\n"
+            "    Log in at https://learning.oreilly.com in Chrome or Firefox, then retry."
+        )
     return cookies
 
 def main():

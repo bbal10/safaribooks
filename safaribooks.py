@@ -60,21 +60,29 @@ def load_saved_cookies():
 
 
 def load_browser_oreilly_cookies():
-    """Read O'Reilly cookies from the local browser. None if the reader is unavailable."""
+    """Read O'Reilly cookies from the local browser. None if the reader is unavailable.
+
+    browser_cookie3.load() walks every browser and aborts on the first unexpected
+    error. Arc has no Linux cookie path and raises TypeError, which drops cookies
+    already read from Chrome or Firefox. Try each browser on its own instead.
+    """
     try:
         import browser_cookie3
     except ImportError:
         load_browser_oreilly_cookies.missing = True
         return None
 
-    try:
-        jar = browser_cookie3.load(domain_name="oreilly.com")
-    except Exception:
-        return None
-
+    browsers = getattr(browser_cookie3, "all_browsers", ())
     cookies = {}
-    for cookie in jar:
-        if cookie.value:
+    for browser in browsers:
+        try:
+            jar = browser(domain_name="oreilly.com")
+        except Exception:
+            continue
+        for cookie in jar:
+            domain = (getattr(cookie, "domain", "") or "").lower()
+            if "oreilly" not in domain or not cookie.value:
+                continue
             cookies[cookie.name] = cookie.value
     return cookies
 
