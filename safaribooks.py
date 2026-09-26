@@ -3,6 +3,7 @@
 import re
 import os
 import sys
+import glob
 import json
 import time
 import base64
@@ -59,32 +60,113 @@ def load_saved_cookies():
     return {}
 
 
+# Chrome on Linux stores the live session in Default/Network/Cookies. browser_cookie3
+# opens the first match of Default/Cookies and never looks at Network/Cookies.
+_CHROMIUM_NETWORK_COOKIE_GLOBS = (
+    "~/.config/google-chrome*/*/Network/Cookies",
+    "~/.config/chromium*/*/Network/Cookies",
+    "~/.config/BraveSoftware/*/*/Network/Cookies",
+    "~/.config/microsoft-edge*/*/Network/Cookies",
+    "~/.config/vivaldi*/*/Network/Cookies",
+    "~/.var/app/com.google.Chrome/config/google-chrome*/*/Network/Cookies",
+    "~/.var/app/org.chromium.Chromium/config/chromium*/*/Network/Cookies",
+    "~/.var/app/com.brave.Browser/config/BraveSoftware/*/*/Network/Cookies",
+    "~/.var/app/com.microsoft.Edge/config/microsoft-edge*/*/Network/Cookies",
+    "~/snap/chromium/common/chromium/*/Network/Cookies",
+)
+
+
+def _chromium_network_cookie_files():
+    found = []
+    for pattern in _CHROMIUM_NETWORK_COOKIE_GLOBS:
+        found.extend(glob.glob(os.path.expanduser(pattern)))
+    return list(dict.fromkeys(found))
+
+
+def _loader_for_cookie_file(browser_cookie3, path):
+    low = path.lower()
+    if "brave" in low:
+        return browser_cookie3.brave
+    if "edge" in low:
+        return browser_cookie3.edge
+    if "vivaldi" in low:
+        return browser_cookie3.vivaldi
+    if "chromium" in low and "google-chrome" not in low:
+        return browser_cookie3.chromium
+    return browser_cookie3.chrome
+
+
+def _oreilly_cookies_from_jar(jar):
+    cookies = {}
+    names = []
+    for cookie in jar:
+        domain = (getattr(cookie, "domain", "") or "").lower()
+        if "oreilly" not in domain or not cookie.value:
+            continue
+        cookies[cookie.name] = cookie.value
+        names.append(cookie.name)
+    return cookies, names
+
+
 def load_browser_oreilly_cookies():
     """Read O'Reilly cookies from the local browser. None if the reader is unavailable.
 
-    browser_cookie3.load() walks every browser and aborts on the first unexpected
-    error. Arc has no Linux cookie path and raises TypeError, which drops cookies
-    already read from Chrome or Firefox. Try each browser on its own instead.
+    Each browser is opened on its own. browser_cookie3.load() aborts on Arc, which
+    has no Linux cookie path. Chromium Network/Cookies files are opened explicitly
+    because the library's default path still points at the legacy Cookies file.
     """
     try:
         import browser_cookie3
     except ImportError:
         load_browser_oreilly_cookies.missing = True
+        load_browser_oreilly_cookies.report = []
         return None
 
-    browsers = getattr(browser_cookie3, "all_browsers", ())
-    cookies = {}
-    for browser in browsers:
+    notes = []
+    best = None  # (exp, cookies)
+    seen_names = []
+
+    def consider(cookies, names, label):
+        nonlocal best
+        if names:
+            seen_names.append("%s: %s" % (label, ", ".join(sorted(set(names)))))
+        token = cookies.get("orm-jwt")
+        if not token:
+            return
+        exp = jwt_expiry(token) or 0
+        if best is None or exp >= best[0]:
+            best = (exp, cookies)
+
+    for browser in getattr(browser_cookie3, "all_browsers", ()):
+        label = getattr(browser, "__name__", "browser")
         try:
             jar = browser(domain_name="oreilly.com")
-        except Exception:
+        except Exception as error:
+            notes.append("%s: %s" % (label, error.__class__.__name__))
             continue
-        for cookie in jar:
-            domain = (getattr(cookie, "domain", "") or "").lower()
-            if "oreilly" not in domain or not cookie.value:
-                continue
-            cookies[cookie.name] = cookie.value
-    return cookies
+        try:
+            cookies, names = _oreilly_cookies_from_jar(jar)
+        except Exception as error:
+            notes.append("%s: %s" % (label, error.__class__.__name__))
+            continue
+        consider(cookies, names, label)
+
+    for path in _chromium_network_cookie_files():
+        loader = _loader_for_cookie_file(browser_cookie3, path)
+        try:
+            jar = loader(cookie_file=path, domain_name="oreilly.com")
+            cookies, names = _oreilly_cookies_from_jar(jar)
+        except Exception as error:
+            notes.append("%s: %s" % (path, error.__class__.__name__))
+            continue
+        consider(cookies, names, path)
+
+    if not seen_names and not _chromium_network_cookie_files():
+        notes.append("no O'Reilly cookies and no Chrome Network/Cookies database under $HOME")
+    load_browser_oreilly_cookies.report = notes + seen_names
+    if best is None:
+        return {}
+    return best[1]
 
 
 def merge_fresher_cookies(saved, browser_cookies):
