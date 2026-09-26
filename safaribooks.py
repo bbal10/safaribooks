@@ -60,31 +60,55 @@ def load_saved_cookies():
     return {}
 
 
-# Chrome on Linux stores the live session in Default/Network/Cookies. browser_cookie3
-# opens the first match of Default/Cookies and never looks at Network/Cookies.
-_CHROMIUM_NETWORK_COOKIE_GLOBS = (
-    "~/.config/google-chrome*/*/Network/Cookies",
-    "~/.config/chromium*/*/Network/Cookies",
-    "~/.config/BraveSoftware/*/*/Network/Cookies",
-    "~/.config/microsoft-edge*/*/Network/Cookies",
-    "~/.config/vivaldi*/*/Network/Cookies",
-    "~/.var/app/com.google.Chrome/config/google-chrome*/*/Network/Cookies",
-    "~/.var/app/org.chromium.Chromium/config/chromium*/*/Network/Cookies",
-    "~/.var/app/com.brave.Browser/config/BraveSoftware/*/*/Network/Cookies",
-    "~/.var/app/com.microsoft.Edge/config/microsoft-edge*/*/Network/Cookies",
-    "~/snap/chromium/common/chromium/*/Network/Cookies",
-)
+_SKIP_WALK = {
+    ".git", "venv", ".venv", "node_modules", "Books", "__pycache__",
+    "site-packages", ".cache",
+}
+_COOKIE_FILENAMES = {"Cookies", "cookies.sqlite"}
+_MISSING_COOKIE_DB = ("failed to find", "could not find", "cannot find", "can not find")
 
 
-def _chromium_network_cookie_files():
+def _cookie_search_roots():
+    roots = []
+    home = os.path.expanduser("~")
+    if home and home != "~" and os.path.isdir(home):
+        roots.append(home)
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg and os.path.isdir(xdg) and xdg not in roots:
+        roots.append(xdg)
+    return roots
+
+
+def _find_cookie_databases():
+    """Find Chromium Cookies and Firefox cookies.sqlite files under the current home.
+
+    Snap, Flatpak, and Network/Cookies layouts are not on browser_cookie3's default
+    path list, so a normal login is invisible when only those defaults are tried.
+    """
     found = []
-    for pattern in _CHROMIUM_NETWORK_COOKIE_GLOBS:
-        found.extend(glob.glob(os.path.expanduser(pattern)))
+    for root in _cookie_search_roots():
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [name for name in dirnames if name not in _SKIP_WALK]
+            if dirpath[len(root):].count(os.sep) > 8:
+                dirnames[:] = []
+                continue
+            for name in filenames:
+                if name not in _COOKIE_FILENAMES:
+                    continue
+                path = os.path.join(dirpath, name)
+                try:
+                    with open(path, "rb") as handle:
+                        if handle.read(16).startswith(b"SQLite format 3"):
+                            found.append(path)
+                except OSError:
+                    continue
     return list(dict.fromkeys(found))
 
 
 def _loader_for_cookie_file(browser_cookie3, path):
     low = path.lower()
+    if os.path.basename(path) == "cookies.sqlite" or "mozilla" in low or "firefox" in low:
+        return browser_cookie3.firefox
     if "brave" in low:
         return browser_cookie3.brave
     if "edge" in low:
@@ -94,6 +118,22 @@ def _loader_for_cookie_file(browser_cookie3, path):
     if "chromium" in low and "google-chrome" not in low:
         return browser_cookie3.chromium
     return browser_cookie3.chrome
+
+
+def _open_cookie_file(browser_cookie3, path):
+    primary = _loader_for_cookie_file(browser_cookie3, path)
+    fallbacks = [primary]
+    if primary is not browser_cookie3.firefox:
+        for extra in (browser_cookie3.chrome, browser_cookie3.chromium):
+            if extra not in fallbacks:
+                fallbacks.append(extra)
+    last_error = None
+    for loader in fallbacks:
+        try:
+            return loader(cookie_file=path, domain_name="oreilly.com")
+        except Exception as error:
+            last_error = error
+    raise last_error
 
 
 def _oreilly_cookies_from_jar(jar):
@@ -142,27 +182,37 @@ def load_browser_oreilly_cookies():
         try:
             jar = browser(domain_name="oreilly.com")
         except Exception as error:
-            notes.append("%s: %s" % (label, error.__class__.__name__))
+            text = str(error).lower()
+            if any(phrase in text for phrase in _MISSING_COOKIE_DB):
+                continue
+            notes.append("%s: %s" % (label, error))
             continue
         try:
             cookies, names = _oreilly_cookies_from_jar(jar)
         except Exception as error:
-            notes.append("%s: %s" % (label, error.__class__.__name__))
+            notes.append("%s: %s" % (label, error))
             continue
         consider(cookies, names, label)
 
-    for path in _chromium_network_cookie_files():
-        loader = _loader_for_cookie_file(browser_cookie3, path)
+    databases = _find_cookie_databases()
+    for path in databases:
         try:
-            jar = loader(cookie_file=path, domain_name="oreilly.com")
+            jar = _open_cookie_file(browser_cookie3, path)
             cookies, names = _oreilly_cookies_from_jar(jar)
         except Exception as error:
-            notes.append("%s: %s" % (path, error.__class__.__name__))
+            notes.append("%s: %s" % (path, error))
+            continue
+        if not names:
+            notes.append("%s: opened, no O'Reilly cookies" % path)
             continue
         consider(cookies, names, path)
 
-    if not seen_names and not _chromium_network_cookie_files():
-        notes.append("no O'Reilly cookies and no Chrome Network/Cookies database under $HOME")
+    if not databases and best is None:
+        home = os.path.expanduser("~")
+        notes.append(
+            "no browser cookie database under %s. A login in a browser on another machine is not visible here."
+            % home
+        )
     load_browser_oreilly_cookies.report = notes + seen_names
     if best is None:
         return {}

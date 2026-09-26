@@ -21,8 +21,8 @@ def get_oreilly_cookies():
         report = "\n".join("    %s" % line for line in load_browser_oreilly_cookies.report)
         detail = ("\n" + report) if report else ""
         raise RuntimeError(
-            "No orm-jwt cookie found in the local browser.%s\n"
-            "    Log in at https://learning.oreilly.com in Chrome or Firefox on this machine, then retry."
+            "No orm-jwt cookie found for this user.%s\n"
+            "    The browser that is logged in has to be on this same machine and user."
             % detail
         )
     return cookies
