@@ -4,6 +4,8 @@ import re
 import os
 import sys
 import json
+import time
+import base64
 import shutil
 import pathlib
 import getpass
@@ -20,6 +22,137 @@ from urllib.parse import urljoin, urlparse, parse_qs, quote_plus
 
 PATH = os.path.dirname(os.path.realpath(__file__))
 COOKIES_FILE = os.path.join(PATH, "cookies.json")
+# Re-read the browser session before orm-jwt actually expires.
+JWT_REFRESH_MARGIN_SECONDS = 10 * 60
+# How long to wait for the open O'Reilly tab to write a newer orm-jwt.
+JWT_REFRESH_WAIT_SECONDS = 3 * 60
+
+
+class AuthExpired(Exception):
+    """Raised when the O'Reilly session is dead and the browser has no newer cookie."""
+
+
+def jwt_expiry(token):
+    """Return the orm-jwt exp claim as a unix timestamp, or None."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        exp = data.get("exp")
+        if isinstance(exp, (int, float)):
+            return int(exp)
+    except Exception:
+        return None
+    return None
+
+
+def load_saved_cookies():
+    if not os.path.isfile(COOKIES_FILE):
+        return {}
+    try:
+        with open(COOKIES_FILE) as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            return {key: value for key, value in data.items() if value}
+    except (OSError, ValueError):
+        return {}
+    return {}
+
+
+def load_browser_oreilly_cookies():
+    """Read O'Reilly cookies from the local browser. None if the reader is unavailable."""
+    try:
+        import browser_cookie3
+    except ImportError:
+        load_browser_oreilly_cookies.missing = True
+        return None
+
+    try:
+        jar = browser_cookie3.load(domain_name="oreilly.com")
+    except Exception:
+        return None
+
+    cookies = {}
+    for cookie in jar:
+        if cookie.value:
+            cookies[cookie.name] = cookie.value
+    return cookies
+
+
+def merge_fresher_cookies(saved, browser_cookies):
+    """Prefer whichever orm-jwt expires later. Browser-only cookies fill gaps."""
+    if not browser_cookies:
+        return dict(saved or {})
+    if not saved:
+        return dict(browser_cookies)
+
+    saved_exp = jwt_expiry(saved.get("orm-jwt", "")) or 0
+    browser_exp = jwt_expiry(browser_cookies.get("orm-jwt", "")) or 0
+    if browser_exp >= saved_exp and browser_cookies.get("orm-jwt"):
+        merged = dict(saved)
+        merged.update(browser_cookies)
+        return merged
+    return dict(saved)
+
+
+def persist_cookies(cookies):
+    """Write cookies.json. Never replace a live orm-jwt with an empty or older one."""
+    fresh = {key: value for key, value in (cookies or {}).items() if value}
+    if not fresh.get("orm-jwt"):
+        return False
+
+    current = load_saved_cookies()
+    current_exp = jwt_expiry(current.get("orm-jwt", "")) or 0
+    fresh_exp = jwt_expiry(fresh.get("orm-jwt", "")) or 0
+    if current.get("orm-jwt") and fresh_exp and current_exp > fresh_exp:
+        return False
+
+    current.update(fresh)
+    with open(COOKIES_FILE, "w") as handle:
+        json.dump(current, handle)
+    return True
+
+
+_WAITED_FOR_TOKEN = None
+
+
+def wait_for_browser_jwt(current_token):
+    """Poll the browser until it has a different, still-valid orm-jwt.
+
+    The same dead token is only waited on once, so a long queue does not
+    pause again for every remaining book.
+    """
+    global _WAITED_FOR_TOKEN
+    if _WAITED_FOR_TOKEN == (current_token or ""):
+        return None
+
+    if getattr(load_browser_oreilly_cookies, "missing", False) or (
+        load_browser_oreilly_cookies() is None and getattr(load_browser_oreilly_cookies, "missing", False)
+    ):
+        print("browser_cookie3 is not installed, so cookies cannot be re-read from the browser.")
+        print("Install it with: ./venv/bin/pip install browser_cookie3")
+        _WAITED_FOR_TOKEN = current_token or ""
+        return None
+
+    print(
+        "\nSession cookie is about to expire or is already dead.\n"
+        "Leave https://learning.oreilly.com open and reload that tab.\n"
+        "Waiting up to %d seconds for a new orm-jwt from the browser..."
+        % JWT_REFRESH_WAIT_SECONDS
+    )
+    deadline = time.time() + JWT_REFRESH_WAIT_SECONDS
+    while time.time() < deadline:
+        browser_cookies = load_browser_oreilly_cookies()
+        token = (browser_cookies or {}).get("orm-jwt")
+        exp = jwt_expiry(token) if token else None
+        if token and token != current_token and exp and exp > time.time() + 30:
+            print("Picked up a new orm-jwt from the browser.")
+            return browser_cookies
+        time.sleep(5)
+    print("No new orm-jwt showed up in the browser.")
+    _WAITED_FOR_TOKEN = current_token or ""
+    return None
+
 
 ORLY_BASE_HOST = "oreilly.com"  # PLEASE INSERT URL HERE
 
@@ -215,14 +348,6 @@ class Display:
                        "    `" + SAFARI_BASE_URL + "/library/view/book-name/XXXXXXXXXXXXX/`"
 
         else:
-            # Only remove cookies when we are sure the session is invalid,
-            # not when a single book is missing.
-            if isinstance(response, dict) and "detail" in response:
-                try:
-                    if os.path.isfile(COOKIES_FILE):
-                        os.remove(COOKIES_FILE)
-                except OSError:
-                    pass
             if detail:
                 message += "Out-of-Session (%s).\n" % detail
             else:
@@ -347,17 +472,33 @@ class SafariBooks:
         self.jwt = {}
 
         if not args.cred:
-            if not os.path.isfile(COOKIES_FILE):
-                self.display.exit("Login: unable to find `cookies.json` file.\n"
-                                  "    Please use the `--cred` or `--login` options to perform the login.")
-
-            self.session.cookies.update(json.load(open(COOKIES_FILE)))
+            cookies = merge_fresher_cookies(load_saved_cookies(), load_browser_oreilly_cookies())
+            token = cookies.get("orm-jwt", "")
+            exp = jwt_expiry(token) if token else None
+            self._browser_refresh_exhausted = False
+            if not token or (exp and exp < time.time() + JWT_REFRESH_MARGIN_SECONDS):
+                refreshed = wait_for_browser_jwt(token)
+                if refreshed:
+                    cookies = merge_fresher_cookies(cookies, refreshed)
+                    token = cookies.get("orm-jwt", "")
+                    exp = jwt_expiry(token) if token else None
+                else:
+                    self._browser_refresh_exhausted = True
+            if not token or (exp and exp <= time.time()):
+                self.display.error(
+                    "Authentication issue: orm-jwt is missing or expired.\n"
+                    "    Reload https://learning.oreilly.com in the browser, then retry."
+                )
+                raise AuthExpired()
+            self.session.cookies.update(cookies)
+            if not args.no_cookies:
+                persist_cookies(cookies)
 
         else:
             self.display.info("Logging into Safari Books Online...", state=True)
             self.do_login(*args.cred)
             if not args.no_cookies:
-                json.dump(self.session.cookies.get_dict(), open(COOKIES_FILE, 'w'))
+                persist_cookies(self.session.cookies.get_dict())
 
         self.check_login()
 
@@ -430,7 +571,7 @@ class SafariBooks:
         self.create_epub()
 
         if not args.no_cookies:
-            json.dump(self.session.cookies.get_dict(), open(COOKIES_FILE, "w"))
+            persist_cookies(self.session.cookies.get_dict())
 
         self.display.done(os.path.join(self.BOOK_PATH, self.book_id + ".epub"))
         self.display.unregister()
@@ -541,18 +682,36 @@ class SafariBooks:
             self.display.exit("Login: unable to reach Safari Books Online. Try again...")
 
     def check_login(self):
-        response = self.requests_provider(PROFILE_URL, perform_redirect=False)
+        response = self._profile_response()
+        if response != 0 and response.status_code == 200 and "user_type\":\"Expired\"" not in response.text:
+            self.display.info("Successfully authenticated.", state=True)
+            return
+
+        if response != 0 and "user_type\":\"Expired\"" in response.text:
+            self.display.exit("Authentication issue: account subscription expired.")
+
+        current = ""
+        for cookie in self.session.cookies:
+            if cookie.name == "orm-jwt" and cookie.value:
+                current = cookie.value
+                break
+        refreshed = None if getattr(self, "_browser_refresh_exhausted", False) else wait_for_browser_jwt(current)
+        if refreshed:
+            self.session.cookies.update(refreshed)
+            if not self.args.no_cookies:
+                persist_cookies(refreshed)
+            response = self._profile_response()
+            if response != 0 and response.status_code == 200 and "user_type\":\"Expired\"" not in response.text:
+                self.display.info("Successfully authenticated.", state=True)
+                return
 
         if response == 0:
             self.display.exit("Login: unable to reach Safari Books Online. Try again...")
+        self.display.error("Authentication issue: unable to access profile page.")
+        raise AuthExpired()
 
-        elif response.status_code != 200:
-            self.display.exit("Authentication issue: unable to access profile page.")
-
-        elif "user_type\":\"Expired\"" in response.text:
-            self.display.exit("Authentication issue: account subscription expired.")
-
-        self.display.info("Successfully authenticated.", state=True)
+    def _profile_response(self):
+        return self.requests_provider(PROFILE_URL, perform_redirect=False)
 
     @staticmethod
     def _to_xhtml_filename(filename):
@@ -1498,6 +1657,10 @@ if __name__ == "__main__":
         try:
             args_parsed.bookid = book_id
             SafariBooks(args_parsed)
+        except AuthExpired:
+            print("Session expired. Stopped the queue so the remaining books are not requested with a dead cookie.")
+            print("Reload https://learning.oreilly.com in the browser, then run the remaining ids.")
+            break
         except SystemExit as e:
             if e.code != 0:
                 print("Error downloading book %s, continuing with next book..." % book_id)

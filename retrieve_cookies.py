@@ -13,10 +13,22 @@ except ImportError:
     raise ImportError("Please run this program via: uv run --with browser_cookie3 python retrieve_cookies.py")
 
 def get_oreilly_cookies():
-    cj = browser_cookie3.load()
+    try:
+        from safaribooks import load_browser_oreilly_cookies
+    except ImportError:
+        load_browser_oreilly_cookies = None
+
+    if load_browser_oreilly_cookies is not None:
+        cookies = load_browser_oreilly_cookies()
+        if cookies is None:
+            raise RuntimeError("Could not read O'Reilly cookies from the local browser.")
+        return cookies
+
+    cj = browser_cookie3.load(domain_name="oreilly.com")
     cookies = {}
     for c in cj:
-        cookies[c.name] = c.value
+        if c.value:
+            cookies[c.name] = c.value
     return cookies
 
 def main():
